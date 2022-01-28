@@ -88,7 +88,7 @@ function check_variables() {
     check_variables_boolean "DEVICE_TRIM" "$DEVICE_TRIM"
     check_variables_boolean "LVM" "$LVM"
     check_variables_equals "LUKS_PASSWORD" "LUKS_PASSWORD_RETYPE" "$LUKS_PASSWORD" "$LUKS_PASSWORD_RETYPE"
-    check_variables_list "FILE_SYSTEM_TYPE" "$FILE_SYSTEM_TYPE" "ext4 btrfs xfs f2fs reiserfs" "true" "true"
+    check_variables_list "FILE_SYSTEM_TYPE" "$FILE_SYSTEM_TYPE" "ext4 btrfs xfs f2fs reiserfs zfs" "true" "true"
     check_variables_size "BTRFS_SUBVOLUME_ROOT" ${#BTRFS_SUBVOLUME_ROOT[@]} 3
     check_variables_list "BTRFS_SUBVOLUME_ROOT" "${BTRFS_SUBVOLUME_ROOT[2]}" "/" "true" "true"
     if [ -n "$SWAP_SIZE" ]; then
@@ -390,86 +390,99 @@ function partition() {
     partition_setup
 
     # partition
-    if [ "$PARTITION_MODE" == "auto" ]; then
-        sgdisk --zap-all $DEVICE
-        sgdisk -o $DEVICE
-        wipefs -a -f $DEVICE
-        partprobe -s $DEVICE
+    if [ "$FILE_SYSTEM_TYPE" != zfs ]; then
+      if [ "$PARTITION_MODE" == "auto" ]; then
+          sgdisk --zap-all $DEVICE
+          sgdisk -o $DEVICE
+          wipefs -a -f $DEVICE
+          partprobe -s $DEVICE
+      fi
+      if [ "$PARTITION_MODE" == "auto" -o "$PARTITION_MODE" == "custom" ]; then
+          if [ "$BIOS_TYPE" == "uefi" ]; then
+              parted -s $DEVICE $PARTITION_PARTED_UEFI
+              if [ -n "$LUKS_PASSWORD" ]; then
+                  sgdisk -t=$PARTITION_ROOT_NUMBER:8309 $DEVICE
+              elif [ "$LVM" == "true" ]; then
+                  sgdisk -t=$PARTITION_ROOT_NUMBER:8e00 $DEVICE
+              fi
+          fi
+
+          if [ "$BIOS_TYPE" == "bios" ]; then
+              parted -s $DEVICE $PARTITION_PARTED_BIOS
+          fi
+
+          partprobe -s $DEVICE
+      fi
+
+      exit
+      # luks and lvm
+      if [ -n "$LUKS_PASSWORD" ]; then
+          echo -n "$LUKS_PASSWORD" | cryptsetup --key-size=512 --key-file=- luksFormat --type luks2 $PARTITION_ROOT
+          echo -n "$LUKS_PASSWORD" | cryptsetup --key-file=- open $PARTITION_ROOT $LUKS_DEVICE_NAME
+          sleep 5
+      fi
+
+      if [ "$LVM" == "true" ]; then
+          if [ -n "$LUKS_PASSWORD" ]; then
+              DEVICE_LVM="/dev/mapper/$LUKS_DEVICE_NAME"
+          else
+              DEVICE_LVM="$DEVICE_ROOT"
+          fi
+
+          if [ "$PARTITION_MODE" == "auto" ]; then
+              set +e
+              lvs $LVM_VOLUME_GROUP-$LVM_VOLUME_LOGICAL
+              if [ $? == 0 ]; then
+                  lvremove -y $LVM_VOLUME_GROUP/$LVM_VOLUME_LOGICAL
+              fi
+              vgs $LVM_VOLUME_GROUP
+              if [ $? == 0 ]; then
+                  vgremove -y $LVM_VOLUME_GROUP
+              fi
+              pvs $DEVICE_LVM
+              if [ $? == 0 ]; then
+                  pvremove -y $DEVICE_LVM
+              fi
+              set -e
+
+              pvcreate -y $DEVICE_LVM
+              vgcreate -y $LVM_VOLUME_GROUP $DEVICE_LVM
+              lvcreate -y -l 100%FREE -n $LVM_VOLUME_LOGICAL $LVM_VOLUME_GROUP
+          fi
+      fi
+
+      if [ -n "$LUKS_PASSWORD" ]; then
+          DEVICE_ROOT="/dev/mapper/$LUKS_DEVICE_NAME"
+      fi
+      if [ "$LVM" == "true" ]; then
+          DEVICE_ROOT="/dev/mapper/$LVM_VOLUME_GROUP-$LVM_VOLUME_LOGICAL"
+      fi
+
+      # format
+      wipefs -a -f $PARTITION_BOOT || true
+      wipefs -a -f $DEVICE_ROOT || true
+
+      if [ "$BIOS_TYPE" == "uefi" ]; then
+          mkfs.fat -n ESP -F32 $PARTITION_BOOT
+      fi
+      if [ "$BIOS_TYPE" == "bios" ]; then
+          mkfs.ext4 -L boot $PARTITION_BOOT
+      fi
+      if [ "$FILE_SYSTEM_TYPE" == "f2fs" -o "$FILE_SYSTEM_TYPE" == "reiserfs" ]; then
+          mkfs."$FILE_SYSTEM_TYPE" -l root $DEVICE_ROOT
+      else
+          mkfs."$FILE_SYSTEM_TYPE" -L root $DEVICE_ROOT
+      fi
     fi
-    if [ "$PARTITION_MODE" == "auto" -o "$PARTITION_MODE" == "custom" ]; then
-        if [ "$BIOS_TYPE" == "uefi" ]; then
-            parted -s $DEVICE $PARTITION_PARTED_UEFI
-            if [ -n "$LUKS_PASSWORD" ]; then
-                sgdisk -t=$PARTITION_ROOT_NUMBER:8309 $DEVICE
-            elif [ "$LVM" == "true" ]; then
-                sgdisk -t=$PARTITION_ROOT_NUMBER:8e00 $DEVICE
-            fi
-        fi
 
-        if [ "$BIOS_TYPE" == "bios" ]; then
-            parted -s $DEVICE $PARTITION_PARTED_BIOS
-        fi
-
-        partprobe -s $DEVICE
-    fi
-
-    # luks and lvm
-    if [ -n "$LUKS_PASSWORD" ]; then
-        echo -n "$LUKS_PASSWORD" | cryptsetup --key-size=512 --key-file=- luksFormat --type luks2 $PARTITION_ROOT
-        echo -n "$LUKS_PASSWORD" | cryptsetup --key-file=- open $PARTITION_ROOT $LUKS_DEVICE_NAME
-        sleep 5
-    fi
-
-    if [ "$LVM" == "true" ]; then
-        if [ -n "$LUKS_PASSWORD" ]; then
-            DEVICE_LVM="/dev/mapper/$LUKS_DEVICE_NAME"
-        else
-            DEVICE_LVM="$DEVICE_ROOT"
-        fi
-
-        if [ "$PARTITION_MODE" == "auto" ]; then
-            set +e
-            lvs $LVM_VOLUME_GROUP-$LVM_VOLUME_LOGICAL
-            if [ $? == 0 ]; then
-                lvremove -y $LVM_VOLUME_GROUP/$LVM_VOLUME_LOGICAL
-            fi
-            vgs $LVM_VOLUME_GROUP
-            if [ $? == 0 ]; then
-                vgremove -y $LVM_VOLUME_GROUP
-            fi
-            pvs $DEVICE_LVM
-            if [ $? == 0 ]; then
-                pvremove -y $DEVICE_LVM
-            fi
-            set -e
-
-            pvcreate -y $DEVICE_LVM
-            vgcreate -y $LVM_VOLUME_GROUP $DEVICE_LVM
-            lvcreate -y -l 100%FREE -n $LVM_VOLUME_LOGICAL $LVM_VOLUME_GROUP
-        fi
-    fi
-
-    if [ -n "$LUKS_PASSWORD" ]; then
-        DEVICE_ROOT="/dev/mapper/$LUKS_DEVICE_NAME"
-    fi
-    if [ "$LVM" == "true" ]; then
-        DEVICE_ROOT="/dev/mapper/$LVM_VOLUME_GROUP-$LVM_VOLUME_LOGICAL"
-    fi
-
-    # format
-    wipefs -a -f $PARTITION_BOOT || true
-    wipefs -a -f $DEVICE_ROOT || true
-
-    if [ "$BIOS_TYPE" == "uefi" ]; then
-        mkfs.fat -n ESP -F32 $PARTITION_BOOT
-    fi
-    if [ "$BIOS_TYPE" == "bios" ]; then
-        mkfs.ext4 -L boot $PARTITION_BOOT
-    fi
-    if [ "$FILE_SYSTEM_TYPE" == "f2fs" -o "$FILE_SYSTEM_TYPE" == "reiserfs" ]; then
-        mkfs."$FILE_SYSTEM_TYPE" -l root $DEVICE_ROOT
-    else
-        mkfs."$FILE_SYSTEM_TYPE" -L root $DEVICE_ROOT
+    if [ "$FILE_SYSTEM_TYPE" == "zfs" ]; then
+      # load ZFS modules
+      load_zfs
+      # identify partition IDs
+      BOOT_PARTITION_ID="$(ls -n /dev/disk/by-id/ | grep $(basename $DEVICE)2 | awk '{print $(NF-2)}')"
+      ROOT_PARTITION_ID="$(ls -n /dev/disk/by-id/ | grep $(basename $DEVICE)3 | awk '{print $(NF-2)}')"
+      echo $ROOT_PARTITION_ID
+      create_zfs_datasets "$BOOT_PARTITION_ID" "$ROOT_PARTITION_ID"
     fi
 
     # options
@@ -539,6 +552,18 @@ function install() {
 
     pacstrap /mnt base base-devel linux linux-firmware
 
+    # add ZFS repository
+    if [ "$FILE_SYSTEM_TYPE" == "zfs" ]; then
+      cat <<EOT >> "/mnt/etc/pacman.conf"
+[archzfs]
+# Mirror - Germany
+Server = http://mirror.sum7.eu/archlinux/archzfs/\$repo/x86_64
+# Mirror - Germany
+Server = https://mirror.biocrafting.net/archlinux/archzfs/\$repo/x86_64
+SigLevel = Optional TrustAll
+EOT
+    fi
+
     sed -i 's/#Color/Color/' /mnt/etc/pacman.conf
     if [ "$PACMAN_PARALLEL_DOWNLOADS" == "true" ]; then
         sed -i 's/#ParallelDownloads/ParallelDownloads/' /mnt/etc/pacman.conf
@@ -554,7 +579,11 @@ function install() {
 function configuration() {
     print_step "configuration()"
 
-    genfstab -U /mnt >> /mnt/etc/fstab
+    # do not generate fsatab for ZFS
+    if [ "$FILE_SYSTEM_TYPE" != "zfs" ]; then
+      genfstab -U /mnt >> /mnt/etc/fstab
+    fi
+
 
     if [ -n "$SWAP_SIZE" ]; then
         echo "# swap" >> /mnt/etc/fstab
@@ -1088,6 +1117,9 @@ function bootloader() {
     if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
         CMDLINE_LINUX="$CMDLINE_LINUX rootflags=subvol=${BTRFS_SUBVOLUME_ROOT[1]}"
     fi
+    if [ "$FILE_SYSTEM_TYPE" == "zfs" ]; then
+        CMDLINE_LINUX="$CMDLINE_LINUX root=ZFS=rpool\/ROOT\/default"
+    fi
     if [ "$KMS" == "true" ]; then
         case "$DISPLAY_DRIVER" in
             "nvidia" )
@@ -1118,6 +1150,11 @@ function bootloader() {
 }
 
 function bootloader_grub() {
+    # fix for Grub, see: https://wiki.archlinux.org/title/Install_Arch_Linux_on_ZFS#Install_and_configure_Arch_Linux
+    if [ "$FILE_SYSTEM_TYPE" == "zfs" ]; then
+      ZPOOL_VDEV_NAME_PATH=1
+      export ZPOOL_VDEV_NAME_PATH
+    fi
     pacman_install "grub dosfstools"
     arch-chroot /mnt sed -i 's/GRUB_DEFAULT=0/GRUB_DEFAULT=saved/' /etc/default/grub
     arch-chroot /mnt sed -i 's/#GRUB_SAVEDEFAULT="true"/GRUB_SAVEDEFAULT="true"/' /etc/default/grub
@@ -1721,6 +1758,7 @@ function main() {
     execute_step "prepare"
     execute_step "partition"
     execute_step "install"
+    execute_step "configure_zfs"
     execute_step "configuration"
     execute_step "mkinitcpio_configuration"
     execute_step "users"

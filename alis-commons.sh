@@ -25,6 +25,93 @@ BLUE='\033[0;96m'
 WHITE='\033[0;97m'
 NC='\033[0m'
 
+# configure ZFS setup
+function configure_zfs(){
+  pacman_install zfs-linux
+  arch-chroot /mnt zpool set cachefile=/etc/zfs/zpool.cache rpool
+  arch-chroot /mnt zpool set cachefile=/etc/zfs/zpool.cache bpool
+  arch-chroot /mnt systemctl enable zfs-import-cache zfs-import.target zfs-mount zfs-zed zfs.target
+}
+
+# loads ZFS modules to live system
+# see: https://github.com/eoli3n/archiso-zfs
+function load_zfs(){
+  curl -s https://eoli3n.github.io/archzfs/init | bash
+}
+
+function create_zfs_datasets(){
+
+  ZFS_BOOT_DISK=/dev/disk/by-id/${1}
+  ZFS_ROOT_DISK=/dev/disk/by-id/${2}
+
+  # create ZFS boot pool
+  zpool create -f \
+      -o ashift=12 -d \
+      -o feature@async_destroy=enabled \
+      -o feature@bookmarks=enabled \
+      -o feature@embedded_data=enabled \
+      -o feature@empty_bpobj=enabled \
+      -o feature@enabled_txg=enabled \
+      -o feature@extensible_dataset=enabled \
+      -o feature@filesystem_limits=enabled \
+      -o feature@hole_birth=enabled \
+      -o feature@large_blocks=enabled \
+      -o feature@lz4_compress=enabled \
+      -o feature@spacemap_histogram=enabled \
+      -o feature@zpool_checkpoint=enabled \
+      -O acltype=posixacl -O canmount=off -O compression=lz4 \
+      -O devices=off -O normalization=formD -O relatime=on -O xattr=sa \
+      -O mountpoint=/boot -R /mnt \
+      bpool $ZFS_BOOT_DISK
+
+  # create ZFS root pool
+  echo $ZFS_PASSWORD | zpool create -f -o ashift=12         \
+             -O acltype=posixacl       \
+             -O relatime=on            \
+             -O xattr=sa               \
+             -O dnodesize=legacy       \
+             -O normalization=formD    \
+             -O mountpoint=none        \
+             -O canmount=off           \
+             -O devices=off            \
+             -R /mnt                   \
+             -O compression=lz4        \
+             -O encryption=aes-256-gcm \
+             -O keyformat=passphrase   \
+             -O keylocation=prompt     \
+             rpool $ZFS_ROOT_DISK
+
+  zfs create -o mountpoint=/boot bpool/boot
+
+  zfs create -o mountpoint=none rpool/data
+  zfs create -o mountpoint=none rpool/ROOT
+  zfs create -o mountpoint=/ -o canmount=noauto rpool/ROOT/default
+  zfs create -o mountpoint=/home rpool/data/home
+  zfs create -o mountpoint=/root rpool/data/home/root
+
+  # system datasets
+  zfs create -o mountpoint=/var -o canmount=off rpool/var
+  zfs create rpool/var/log
+  zfs create -o acltype=posixacl rpool/var/logjournal
+  zfs create -o mountpoint=/var/lib -o canmount=off rpool/var/lib
+  zfs create rpool/var/lib/libvirt
+  zfs create rpool/var/lib/docker
+
+  # export and import test
+  zpool export bpool
+  zpool export rpool
+  zpool import -d $ZFS_ROOT_DISK -R /mnt rpool -N
+  zpool import -d $ZFS_BOOT_DISK -R /mnt bpool -N
+
+  echo $ZFS_PASSWORD | zfs load-key rpool
+
+  zfs mount rpool/ROOT/default
+  zfs mount -a
+
+  # set boot property
+  zpool set bootfs=rpool/ROOT/default rpool
+}
+
 function sanitize_variable() {
     local VARIABLE="$1"
     local VARIABLE=$(echo "$VARIABLE" | sed "s/![^ ]*//g") # remove disabled
@@ -310,8 +397,13 @@ function execute_user() {
 }
 
 function do_reboot() {
-    umount -R /mnt/boot
-    umount -R /mnt
+    if [ "$FILE_SYSTEM_TYPE" == "zfs" ]; then
+      zfs umount -a
+      zpool export bpool rpool
+      else
+        umount -R /mnt/boot
+        umount -R /mnt  
+    fi
     reboot
 }
 
@@ -334,8 +426,13 @@ function partition_setup() {
         if [ "$PARTITION_PARTED_FILE_SYSTEM_TYPE" == "f2fs" ]; then
             PARTITION_PARTED_FILE_SYSTEM_TYPE=""
         fi
-        PARTITION_PARTED_UEFI="mklabel gpt mkpart ESP fat32 1MiB 512MiB mkpart root $PARTITION_PARTED_FILE_SYSTEM_TYPE 512MiB 100% set 1 esp on"
-        PARTITION_PARTED_BIOS="mklabel msdos mkpart primary ext4 4MiB 512MiB mkpart primary $PARTITION_PARTED_FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
+        if [ "$PARTITION_PARTED_FILE_SYSTEM_TYPE" == "zfs" ]; then
+            PARTITION_PARTED_UEFI="#TODO"
+            PARTITION_PARTED_BIOS="mklabel gpt mkpart non-fs 0% 2 mkpart bpool 2 1000 mkpart rpool 1000 100% set 1 bios_grub on set 2 boot on"
+          else
+            PARTITION_PARTED_UEFI="mklabel gpt mkpart ESP fat32 1MiB 512MiB mkpart root $PARTITION_PARTED_FILE_SYSTEM_TYPE 512MiB 100% set 1 esp on"
+            PARTITION_PARTED_BIOS="mklabel msdos mkpart primary ext4 4MiB 512MiB mkpart primary $PARTITION_PARTED_FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
+        fi
 
         if [ "$BIOS_TYPE" == "uefi" ]; then
             if [ "$DEVICE_SATA" == "true" ]; then
@@ -434,9 +531,11 @@ function partition_mount() {
             mount -o "subvol=${SUBVOLUME[1]},$PARTITION_OPTIONS,compress=zstd" "$DEVICE_ROOT" "/mnt${SUBVOLUME[2]}"
         done
     else
-        mount -o "$PARTITION_OPTIONS" "$DEVICE_ROOT" /mnt
+      if [ "$FILE_SYSTEM_TYPE" != "zfs" ]; then
+          mount -o "$PARTITION_OPTIONS" "$DEVICE_ROOT" /mnt
 
-        mkdir -p /mnt/boot
-        mount -o "$PARTITION_OPTIONS_BOOT" "$PARTITION_BOOT" /mnt/boot
+          mkdir -p /mnt/boot
+          mount -o "$PARTITION_OPTIONS_BOOT" "$PARTITION_BOOT" /mnt/boot
+      fi
     fi
 }
