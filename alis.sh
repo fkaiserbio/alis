@@ -479,8 +479,8 @@ function partition() {
       # load ZFS modules
       load_zfs
       # identify partition IDs
-      BOOT_PARTITION_ID="$(ls -n /dev/disk/by-id/ | grep $(basename $DEVICE)2 | awk '{print $(NF-2)}')"
-      ROOT_PARTITION_ID="$(ls -n /dev/disk/by-id/ | grep $(basename $DEVICE)3 | awk '{print $(NF-2)}')"
+      BOOT_PARTITION_ID="$(ls -n /dev/disk/by-id/ | grep $(basename $DEVICE)2 | head -1 | awk '{print $(NF-2)}')"
+      ROOT_PARTITION_ID="$(ls -n /dev/disk/by-id/ | grep $(basename $DEVICE)3 | head -1 | awk '{print $(NF-2)}')"
       echo $ROOT_PARTITION_ID
       create_zfs_datasets "$BOOT_PARTITION_ID" "$ROOT_PARTITION_ID"
     fi
