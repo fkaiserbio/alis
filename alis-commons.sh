@@ -27,7 +27,7 @@ NC='\033[0m'
 
 # configure ZFS setup
 function configure_zfs(){
-  pacman_install zfs-linux
+  pacman_install zfs-dkms
   arch-chroot /mnt zpool set cachefile=/etc/zfs/zpool.cache rpool
   arch-chroot /mnt zpool set cachefile=/etc/zfs/zpool.cache bpool
   arch-chroot /mnt systemctl enable zfs-import-cache zfs-import.target zfs-mount zfs-zed zfs.target
